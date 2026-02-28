@@ -21,6 +21,46 @@ TYPE_EFFECTIVENESS = {
     ("Grass", "Water"): 2,
     ("Grass", "Fire"): 0.5,
 }
+spawned_pokemon = {}
+AREAS = {
+    "forest": ["Grass", "Bug"],
+    "ocean": ["Water"],
+    "cave": ["Rock", "Ground"],
+    "volcano": ["Fire"]
+}
+
+def get_area_pokemon(area):
+    conn = sqlite3.connect("pokemon.db")
+    cursor = conn.cursor()
+
+    types = AREAS[area]
+
+    # 70% ambil pokemon tipe area
+    if random.randint(1, 100) <= 70:
+        type_filter = " OR ".join(
+            [f"Type1='{t}' OR Type2='{t}'" for t in types]
+        )
+
+        cursor.execute(f"""
+            SELECT Name, Type1, Type2
+            FROM Pokemon
+            WHERE {type_filter}
+            ORDER BY RANDOM()
+            LIMIT 1
+        """)
+    else:
+        # 30% tipe lain
+        cursor.execute("""
+            SELECT Name, Type1, Type2
+            FROM Pokemon
+            ORDER BY RANDOM()
+            LIMIT 1
+        """)
+
+    result = cursor.fetchone()
+    conn.close()
+
+    return result
 
 def has_pokemon(user_id):
     conn = sqlite3.connect("pokemon.db")
@@ -886,37 +926,62 @@ async def pokedex(ctx, *, name):
 
 @bot.command()
 async def catch(ctx):
-    # 🔒 cek limit
-    total = count_user_pokemon(ctx.author.id)
+    user_id = ctx.author.id
+
+    # ❌ Tidak ada spawn
+    if user_id not in spawned_pokemon:
+        await ctx.send("❌ Tidak ada Pokémon! Gunakan `!explore` dulu.")
+        return
+
+    data = spawned_pokemon[user_id]
+    name = data["name"]
+    level = data["level"]
+    type1 = data["type1"]
+    type2 = data["type2"]
+    area = data["area"]
+
+    # 🎒 cek limit
+    total = count_user_pokemon(user_id)
     if total >= MAX_POKEMON:
         await ctx.send(
             f"🎒 Pokémon kamu sudah penuh!\n"
             f"📦 Maksimal: {MAX_POKEMON}\n"
             f"🗑️ Gunakan `!release` untuk membuang Pokémon."
         )
+        del spawned_pokemon[user_id]
         return
 
-    name = get_random_pokemon()
+    # 🎯 Hitung catch rate berdasarkan area
+    area_types = AREAS[area]
 
-    # 🎯 chance gagal
-    if random.randint(1, 100) > 70:
-        await ctx.send("❌ Pokémon kabur!")
+    if type1 in area_types or type2 in area_types:
+        catch_rate = 85   # sesuai area → lebih mudah
+    else:
+        catch_rate = 50   # tidak sesuai → lebih sulit
+
+    if random.randint(1, 100) > catch_rate:
+        del spawned_pokemon[user_id]
+        await ctx.send("💨 Pokémon kabur!")
         return
 
-    level = random.randint(1, 50)
+    # ⭐ Hitung bonus stat tiap 10 level
     bonus = level // 10
+    bonus_hp = bonus
+    bonus_atk = bonus
+    bonus_def = bonus
+    bonus_speed = bonus
 
     conn = sqlite3.connect("pokemon.db")
     cursor = conn.cursor()
 
-    # ⭐ NONAKTIFKAN POKÉMON AKTIF LAMA
+    # 🔄 Nonaktifkan Pokémon lama
     cursor.execute("""
         UPDATE user_pokemon
         SET is_active = 0
         WHERE user_id = ?
-    """, (str(ctx.author.id),))
+    """, (str(user_id),))
 
-    # ➕ INSERT POKÉMON BARU (AKTIF)
+    # ➕ Insert Pokémon baru sebagai aktif
     cursor.execute("""
         INSERT INTO user_pokemon (
             user_id, pokemon_name, level,
@@ -925,36 +990,53 @@ async def catch(ctx):
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
     """, (
-        str(ctx.author.id),
+        str(user_id),
         name,
         level,
-        bonus, bonus, bonus, bonus,
+        bonus_hp,
+        bonus_atk,
+        bonus_def,
+        bonus_speed,
         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ))
 
     conn.commit()
     conn.close()
 
+    # 📊 Ambil stats final
     stats = get_pokemon_stats(
         name,
-        (bonus, bonus, bonus, bonus)
+        (bonus_hp, bonus_atk, bonus_def, bonus_speed)
     )
 
-    await ctx.send(
-        f"🎉 **Kamu menangkap {name}!** ⭐\n"
-        f"🔥 Pokémon ini sekarang **AKTIF**\n\n"
-        f"⭐ Level: {level}\n"
+    # 🗺️ Reward uang berdasarkan area
+    money_reward = random.randint(50, 150)
+    update_money(user_id, get_money(user_id) + money_reward)
+
+    # 🎓 EXP Player
+    leveled, lvl, exp = add_exp(user_id, 20)
+
+    # 🧹 Hapus spawn
+    del spawned_pokemon[user_id]
+
+    # 📢 Kirim hasil
+    message = (
+        f"🎉 **Kamu berhasil menangkap {name}!** ⭐\n\n"
+        f"🧬 Type: {type1}" +
+        (f"/{type2}" if type2 else "") +
+        f"\n⭐ Level: {level}\n\n"
         f"❤️ HP: {stats['hp']}\n"
         f"⚔️ ATK: {stats['atk']}\n"
         f"🛡️ DEF: {stats['def']}\n"
         f"⚡ SPEED: {stats['speed']}\n\n"
+        f"💰 Mendapat {money_reward} coins\n"
         f"📦 Slot: {total + 1}/{MAX_POKEMON}"
     )
 
-    # 🎓 EXP PLAYER
-    leveled, lvl, exp = add_exp(ctx.author.id, 20)
     if leveled:
-        await ctx.send(f"🆙 **Player naik ke Level {lvl}!**")
+        message += f"\n\n🆙 **Player naik ke Level {lvl}!**"
+
+    await ctx.send(message)
 
 @bot.command()
 async def mypokemon(ctx):
@@ -1107,6 +1189,37 @@ async def feed(ctx, index: int):
 
     await ctx.send(msg)
 
+@bot.command()
+async def explore(ctx, area: str):
+    area = area.lower()
+
+    if area not in AREAS:
+        await ctx.send("❌ Area tidak tersedia.")
+        return
+
+    data = get_area_pokemon(area)
+    if not data:
+        await ctx.send("❌ Tidak menemukan Pokémon.")
+        return
+
+    name, type1, type2 = data
+    level = random.randint(5, 60)
+
+    # simpan spawn sementara
+    spawned_pokemon[ctx.author.id] = {
+        "name": name,
+        "level": level,
+        "type1": type1,
+        "type2": type2,
+        "area": area
+    }
+
+    await ctx.send(
+        f"🗺️ Menjelajahi {area.title()}...\n\n"
+        f"✨ {name} (Lv.{level}) muncul!\n"
+        f"🧬 Type: {type1}" +
+        (f"/{type2}" if type2 else "") +
+        "\nGunakan `!catch` untuk menangkap!"
+    )
 
 bot.run("")
-
